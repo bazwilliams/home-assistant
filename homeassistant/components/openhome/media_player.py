@@ -178,7 +178,24 @@ class OpenhomeDevice(MediaPlayerEntity):
 
     @catch_request_errors()
     async def async_play_media(self, media_type, media_id, **kwargs):
+        import traceback
         """Send the play_media command to the media player."""
+
+        _LOGGER.info("PLAY MEDIA REQUESTED")
+        _LOGGER.info("NAME     : %s" % await self._device.name())
+        _LOGGER.info("ROOM     : %s" % await self._device.room())
+        _LOGGER.info("UUID     : %s" % self._device.uuid())
+        _LOGGER.info("SOURCE   : %s" % await self._device.source())
+        _LOGGER.info("STANDBY  : %s" % await self._device.is_in_standby())
+        _LOGGER.info("STATE    : %s" % await self._device.transport_state())
+        _LOGGER.info("TRACK    : %s" % await self._device.track_info())
+        _LOGGER.info("HAS VOL  : %s" % self._device.volume_enabled)
+        _LOGGER.info("VOLUME   : %s" % await self._device.volume())
+        _LOGGER.info("MUTED    : %s" % await self._device.is_muted())
+        _LOGGER.info("SOURCES  : %s" % await self._device.sources())
+        _LOGGER.info("HAS PINS : %s" % self._device.pins_enabled)
+        _LOGGER.info("PINS     : %s" % await self._device.pins())
+
         if media_type != MEDIA_TYPE_MUSIC:
             _LOGGER.error(
                 "Invalid media type %s. Only %s is supported",
@@ -187,7 +204,27 @@ class OpenhomeDevice(MediaPlayerEntity):
             )
             return
         track_details = {"title": "Home Assistant", "uri": media_id}
-        await self._device.play_media(track_details)
+        _LOGGER.info("play_media: %s", track_details)
+
+        try:
+            await self._device.play_media(track_details)
+        except:
+            traceback.print_exc()
+
+        _LOGGER.info("PLAY MEDIA COMPLETE")
+        _LOGGER.info("NAME     : %s" % await self._device.name())
+        _LOGGER.info("ROOM     : %s" % await self._device.room())
+        _LOGGER.info("UUID     : %s" % self._device.uuid())
+        _LOGGER.info("SOURCE   : %s" % await self._device.source())
+        _LOGGER.info("STANDBY  : %s" % await self._device.is_in_standby())
+        _LOGGER.info("STATE    : %s" % await self._device.transport_state())
+        _LOGGER.info("TRACK    : %s" % await self._device.track_info())
+        _LOGGER.info("HAS VOL  : %s" % self._device.volume_enabled)
+        _LOGGER.info("VOLUME   : %s" % await self._device.volume())
+        _LOGGER.info("MUTED    : %s" % await self._device.is_muted())
+        _LOGGER.info("SOURCES  : %s" % await self._device.sources())
+        _LOGGER.info("HAS PINS : %s" % self._device.pins_enabled)
+        _LOGGER.info("PINS     : %s" % await self._device.pins())
 
     @catch_request_errors()
     async def async_media_pause(self):
