@@ -12,6 +12,7 @@ from homeassistant.const import CONF_HOST, Platform
 from tests.common import MockConfigEntry
 
 HOST = "http://localhost"
+NOTIFY_ADDRESS = "192.0.2.1"
 
 TRACK_INFO = {
     "albumArtwork": "http://localhost/album.jpg",
@@ -42,6 +43,20 @@ ACTION_METHODS = (
     Device.play_media,
     Device.invoke_pin,
 )
+
+
+@pytest.fixture(autouse=True)
+def mock_notify_servers() -> Generator[MagicMock]:
+    """Keep the shared notify server from binding a socket during tests."""
+    servers = MagicMock()
+    servers.async_acquire = AsyncMock(return_value=(NOTIFY_ADDRESS, MagicMock()))
+    servers.async_release = AsyncMock()
+
+    with patch(
+        "homeassistant.components.openhome.async_get_notify_servers",
+        return_value=servers,
+    ):
+        yield servers
 
 
 @pytest.fixture

@@ -22,13 +22,17 @@ async def test_device_uses_shared_session(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
     mock_device_class: MagicMock,
+    mock_notify_servers: MagicMock,
 ) -> None:
-    """Test the device is given Home Assistant's shared aiohttp session."""
+    """Test the device is given the shared aiohttp session and notify server."""
     await setup_integration(hass, mock_config_entry)
 
     assert mock_config_entry.state is ConfigEntryState.LOADED
+    _, event_handler = mock_notify_servers.async_acquire.return_value
     mock_device_class.assert_called_once_with(
-        HOST, session=async_get_clientsession(hass)
+        HOST,
+        session=async_get_clientsession(hass),
+        event_handler=event_handler,
     )
 
 

@@ -30,7 +30,7 @@ async def async_setup_entry(
 
     _LOGGER.debug("Setting up config entry: %s", config_entry.unique_id)
 
-    device = config_entry.runtime_data
+    device = config_entry.runtime_data.device
 
     entity = OpenhomeUpdateEntity(device)
 
