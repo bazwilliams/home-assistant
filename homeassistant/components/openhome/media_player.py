@@ -7,7 +7,7 @@ from typing import Any, Concatenate, override
 
 from openhomedevice.exceptions import OpenhomeError
 
-from homeassistant.components import media_source
+from homeassistant.components import media_source, ssdp
 from homeassistant.components.media_player import (
     SERVICE_PLAY_MEDIA,
     SERVICE_SELECT_SOURCE,
@@ -35,6 +35,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 
 from . import OpenhomeConfigEntry
 from .const import DOMAIN
@@ -47,6 +48,14 @@ SUPPORT_OPENHOME = (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _bootid(info: SsdpServiceInfo) -> int | None:
+    """Return the boot id the announcement carries, if it has one."""
+    try:
+        return int(info.ssdp_headers[ssdp.ATTR_SSDP_BOOTID], 10)
+    except KeyError, ValueError:
+        return None
 
 
 async def async_setup_entry(
@@ -116,6 +125,7 @@ class OpenhomeDevice(MediaPlayerEntity):
         self._source_type: str | None = None
         self._in_standby: bool | None = None
         self._transport_state: str | None = None
+        self._bootid: int | None = None
         self._attr_device_info = DeviceInfo(
             identifiers={
                 (DOMAIN, device.uuid()),
@@ -127,7 +137,17 @@ class OpenhomeDevice(MediaPlayerEntity):
 
     @override
     async def async_added_to_hass(self) -> None:
-        """Subscribe to the device, where it can report its own changes."""
+        """Subscribe to the device, and to what it announces about itself."""
+        self.async_on_remove(
+            await ssdp.async_register_callback(
+                self.hass, self._async_ssdp_change, {"_udn": self._device.uuid()}
+            )
+        )
+
+        await self._async_subscribe()
+
+    async def _async_subscribe(self) -> None:
+        """Subscribe where the device can report its own changes."""
         if not self._device.events_enabled:
             return
 
@@ -143,6 +163,60 @@ class OpenhomeDevice(MediaPlayerEntity):
             return
 
         self._attr_should_poll = False
+
+    async def _async_ssdp_change(
+        self, info: SsdpServiceInfo, change: ssdp.SsdpChange
+    ) -> None:
+        """React to the device announcing itself, or going away.
+
+        Subscriptions are renewed every half hour, so without this a device
+        that disappeared would look subscribed and quiet until then.
+        """
+        bootid = _bootid(info)
+
+        if change is ssdp.SsdpChange.UPDATE:
+            # Only announces that the boot id is about to change. The alive
+            # that follows is what matters.
+            return
+
+        if change is ssdp.SsdpChange.BYEBYE:
+            _LOGGER.debug("%s said goodbye", self.entity_id)
+            await self._async_device_gone()
+            return
+
+        # A different boot id means it restarted, and forgot the subscription
+        # it granted us, whether or not its goodbye arrived.
+        rebooted = self._bootid is not None and bootid != self._bootid
+        self._bootid = bootid
+
+        if rebooted and self._device.is_subscribed:
+            _LOGGER.debug("%s restarted, resubscribing", self.entity_id)
+            await self._device.unsubscribe()
+
+        if not self._device.is_subscribed:
+            await self._async_reconnect()
+
+    async def _async_device_gone(self) -> None:
+        """Release the subscription and report the device as unavailable."""
+        await self._device.unsubscribe()
+        self._attr_available = False
+        self.async_write_ha_state()
+
+    async def _async_reconnect(self) -> None:
+        """Pick the device back up after it announced itself."""
+        try:
+            # The description and the service URLs from it are cached, and a
+            # device that restarted may not describe itself the same way.
+            await self._device.init()
+        except OpenhomeError as err:
+            _LOGGER.debug(
+                "%s announced itself but could not be reached: %s",
+                self.entity_id,
+                err,
+            )
+            return
+
+        await self._async_subscribe()
 
     @override
     async def async_will_remove_from_hass(self) -> None:

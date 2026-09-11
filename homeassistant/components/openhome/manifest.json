@@ -3,9 +3,10 @@
   "name": "Linn / OpenHome",
   "codeowners": ["@bazwilliams"],
   "config_flow": true,
+  "dependencies": ["ssdp"],
   "documentation": "https://www.home-assistant.io/integrations/openhome",
   "integration_type": "device",
-  "iot_class": "local_polling",
+  "iot_class": "local_push",
   "loggers": ["async_upnp_client", "openhomedevice"],
   "requirements": ["openhomedevice==2.6"],
   "ssdp": [

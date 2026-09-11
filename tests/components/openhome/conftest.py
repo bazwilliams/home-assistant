@@ -46,6 +46,27 @@ ACTION_METHODS = (
 
 
 @pytest.fixture(autouse=True)
+def mock_ssdp_component() -> Generator[None]:
+    """Keep the ssdp dependency from listening on the network."""
+    with (
+        patch("homeassistant.components.ssdp.Scanner", autospec=True),
+        patch("homeassistant.components.ssdp.Server", autospec=True),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def mock_ssdp_register() -> Generator[AsyncMock]:
+    """Capture the SSDP callback without needing the ssdp component."""
+    register = AsyncMock(return_value=MagicMock())
+    with patch(
+        "homeassistant.components.openhome.media_player.ssdp.async_register_callback",
+        register,
+    ):
+        yield register
+
+
+@pytest.fixture(autouse=True)
 def mock_notify_servers() -> Generator[MagicMock]:
     """Keep the shared notify server from binding a socket during tests."""
     servers = MagicMock()

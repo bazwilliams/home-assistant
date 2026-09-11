@@ -2,13 +2,14 @@
 
 from collections.abc import Callable, Generator
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from openhomedevice.device import Device
 from openhomedevice.exceptions import OpenhomeConnectionError
 import pytest
 from syrupy.assertion import SnapshotAssertion
 
+from homeassistant.components import ssdp
 from homeassistant.components.media_player import (
     ATTR_INPUT_SOURCE,
     ATTR_MEDIA_CONTENT_ID,
@@ -48,9 +49,10 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 
 from . import async_poll, setup_integration
-from .conftest import TRACK_INFO
+from .conftest import HOST, TRACK_INFO
 
 from tests.common import MockConfigEntry, snapshot_platform
 
@@ -534,3 +536,153 @@ async def test_unsubscribes_on_removal(
     await hass.async_block_till_done()
 
     subscribed_device.unsubscribe.assert_awaited_once()
+
+
+def announcement(bootid: int | None = None) -> SsdpServiceInfo:
+    """Return an SSDP announcement, optionally carrying a boot id."""
+    headers = {} if bootid is None else {ssdp.ATTR_SSDP_BOOTID: str(bootid)}
+    return SsdpServiceInfo(
+        ssdp_usn="uuid:uuid",
+        ssdp_st="urn:av-openhome-org:service:Product:1",
+        ssdp_location=HOST,
+        ssdp_headers=headers,
+        upnp={},
+    )
+
+
+def ssdp_callback(mock_ssdp_register: AsyncMock) -> Callable[..., Any]:
+    """Return the SSDP callback the entity registered."""
+    mock_ssdp_register.assert_awaited_once()
+    return mock_ssdp_register.await_args.args[1]
+
+
+async def test_registers_for_its_own_announcements(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test the entity listens for announcements from its own device."""
+    await setup_integration(hass, mock_config_entry)
+
+    mock_ssdp_register.assert_awaited_once()
+    assert mock_ssdp_register.await_args.args[2] == {"_udn": "uuid"}
+
+
+async def test_byebye_marks_unavailable(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test a device going away releases the subscription."""
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    emitted_callback(subscribed_device)({"is_in_standby": False})
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
+
+    await handle_ssdp(announcement(), ssdp.SsdpChange.BYEBYE)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+    subscribed_device.unsubscribe.assert_awaited()
+
+
+async def test_alive_resubscribes_after_byebye(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test the device is picked back up when it announces itself again."""
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    subscribed_device.is_subscribed = False
+    await handle_ssdp(announcement(), ssdp.SsdpChange.BYEBYE)
+    await hass.async_block_till_done()
+
+    subscribed_device.init.reset_mock()
+    subscribed_device.subscribe.reset_mock()
+
+    await handle_ssdp(announcement(), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    # Re-read the description: a device that restarted may have moved.
+    subscribed_device.init.assert_awaited_once()
+    subscribed_device.subscribe.assert_awaited_once()
+
+
+async def test_alive_while_subscribed_is_left_alone(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test a routine announcement does not disturb a live subscription."""
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    subscribed_device.is_subscribed = True
+    subscribed_device.subscribe.reset_mock()
+
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    subscribed_device.subscribe.assert_not_awaited()
+
+
+async def test_reboot_resubscribes(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test a changed boot id resubscribes, even without a goodbye."""
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    subscribed_device.is_subscribed = True
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    subscribed_device.subscribe.reset_mock()
+    # The device restarted and has forgotten the subscription it granted.
+    subscribed_device.unsubscribe.side_effect = lambda: setattr(
+        subscribed_device, "is_subscribed", False
+    )
+
+    await handle_ssdp(announcement(bootid=2), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    subscribed_device.unsubscribe.assert_awaited()
+    subscribed_device.subscribe.assert_awaited_once()
+
+
+async def test_update_announcement_is_ignored(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test the warning of a coming boot id change is left for the alive."""
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    subscribed_device.is_subscribed = True
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    subscribed_device.unsubscribe.reset_mock()
+    subscribed_device.subscribe.reset_mock()
+
+    # Carries the boot id the device is moving to, so acting on it here would
+    # tear the subscription down while the device is still serving it.
+    await handle_ssdp(announcement(bootid=2), ssdp.SsdpChange.UPDATE)
+    await hass.async_block_till_done()
+
+    subscribed_device.unsubscribe.assert_not_awaited()
+    subscribed_device.subscribe.assert_not_awaited()
