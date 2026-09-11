@@ -112,7 +112,10 @@ class OpenhomeDevice(MediaPlayerEntity):
         """Initialise the Openhome device."""
         self._device = device
         self._attr_unique_id = device.uuid()
-        self._source_index = {}
+        self._source_index: dict[str, int] = {}
+        self._source_type: str | None = None
+        self._in_standby: bool | None = None
+        self._transport_state: str | None = None
         self._attr_device_info = DeviceInfo(
             identifiers={
                 (DOMAIN, device.uuid()),
@@ -125,74 +128,108 @@ class OpenhomeDevice(MediaPlayerEntity):
     async def async_update(self) -> None:
         """Update state of device."""
         try:
-            self._attr_name = await self._device.room()
-            self._attr_supported_features = SUPPORT_OPENHOME
-            source_index = {}
-            source_names = []
-
-            track_information = await self._device.track_info()
-            self._attr_media_image_url = track_information.get("albumArtwork")
-            self._attr_media_album_name = track_information.get("albumTitle")
-            self._attr_media_title = track_information.get("title")
-            if artists := track_information.get("artist"):
-                self._attr_media_artist = artists[0]
-            self._attr_media_content_id = track_information.get("uri")
-            self._attr_media_content_type = MediaType.MUSIC
+            changes: dict[str, Any] = {
+                "room": await self._device.room(),
+                "track_info": await self._device.track_info(),
+                "sources": await self._device.sources(),
+                "source": await self._device.source(),
+                "is_in_standby": await self._device.is_in_standby(),
+                "transport_state": await self._device.transport_state(),
+            }
 
             if self._device.volume_enabled:
-                self._attr_supported_features |= (
-                    MediaPlayerEntityFeature.VOLUME_STEP
-                    | MediaPlayerEntityFeature.VOLUME_MUTE
-                    | MediaPlayerEntityFeature.VOLUME_SET
-                )
-                self._attr_volume_level = await self._device.volume() / 100.0
-                self._attr_is_volume_muted = await self._device.is_muted()
+                changes["volume"] = await self._device.volume()
+                changes["is_muted"] = await self._device.is_muted()
 
-            for source in await self._device.sources():
-                source_names.append(source["name"])
-                source_index[source["name"]] = source["index"]
-
-            source = await self._device.source()
-            self._attr_source = source.get("name")
-            self._source_index = source_index
-            self._attr_source_list = source_names
-
-            if source["type"] in ("Radio", "Receiver"):
-                self._attr_supported_features |= (
-                    MediaPlayerEntityFeature.STOP
-                    | MediaPlayerEntityFeature.PLAY
-                    | MediaPlayerEntityFeature.PLAY_MEDIA
-                    | MediaPlayerEntityFeature.BROWSE_MEDIA
-                )
-            if source["type"] in ("Playlist", "Spotify"):
-                self._attr_supported_features |= (
-                    MediaPlayerEntityFeature.PREVIOUS_TRACK
-                    | MediaPlayerEntityFeature.NEXT_TRACK
-                    | MediaPlayerEntityFeature.PAUSE
-                    | MediaPlayerEntityFeature.PLAY
-                    | MediaPlayerEntityFeature.PLAY_MEDIA
-                    | MediaPlayerEntityFeature.BROWSE_MEDIA
-                )
-
-            in_standby = await self._device.is_in_standby()
-            transport_state = await self._device.transport_state()
-            if in_standby:
-                self._attr_state = MediaPlayerState.OFF
-            elif transport_state == "Paused":
-                self._attr_state = MediaPlayerState.PAUSED
-            elif transport_state in ("Playing", "Buffering"):
-                self._attr_state = MediaPlayerState.PLAYING
-            elif transport_state == "Stopped":
-                self._attr_state = MediaPlayerState.IDLE
-            else:
-                # Device is playing an external source with no transport controls
-                self._attr_state = MediaPlayerState.PLAYING
-
+            self._apply(changes)
             self._attr_available = True
         except OpenhomeError as err:
             if self._attr_available:
                 _LOGGER.warning("Error updating %s: %s", self.entity_id, err)
             self._attr_available = False
+
+    def _apply(self, changes: dict[str, Any]) -> None:
+        """Apply reported values, whichever of them the device sent."""
+        if "room" in changes:
+            self._attr_name = changes["room"]
+
+        if "track_info" in changes:
+            track_info = changes["track_info"]
+            self._attr_media_image_url = track_info.get("albumArtwork")
+            self._attr_media_album_name = track_info.get("albumTitle")
+            self._attr_media_title = track_info.get("title")
+            if artists := track_info.get("artist"):
+                self._attr_media_artist = artists[0]
+            self._attr_media_content_id = track_info.get("uri")
+            self._attr_media_content_type = MediaType.MUSIC
+
+        if "volume" in changes:
+            self._attr_volume_level = changes["volume"] / 100.0
+
+        if "is_muted" in changes:
+            self._attr_is_volume_muted = changes["is_muted"]
+
+        if "sources" in changes:
+            sources = changes["sources"]
+            self._source_index = {source["name"]: source["index"] for source in sources}
+            self._attr_source_list = [source["name"] for source in sources]
+
+        if "source" in changes:
+            self._attr_source = changes["source"].get("name")
+            self._source_type = changes["source"].get("type")
+
+        if "is_in_standby" in changes:
+            self._in_standby = changes["is_in_standby"]
+
+        if "transport_state" in changes:
+            self._transport_state = changes["transport_state"]
+
+        self._attr_supported_features = self._supported_features()
+        self._attr_state = self._state()
+
+    def _supported_features(self) -> MediaPlayerEntityFeature:
+        """Return what the device offers on the source it is playing."""
+        features = SUPPORT_OPENHOME
+
+        if self._device.volume_enabled:
+            features |= (
+                MediaPlayerEntityFeature.VOLUME_STEP
+                | MediaPlayerEntityFeature.VOLUME_MUTE
+                | MediaPlayerEntityFeature.VOLUME_SET
+            )
+
+        if self._source_type in ("Radio", "Receiver"):
+            features |= (
+                MediaPlayerEntityFeature.STOP
+                | MediaPlayerEntityFeature.PLAY
+                | MediaPlayerEntityFeature.PLAY_MEDIA
+                | MediaPlayerEntityFeature.BROWSE_MEDIA
+            )
+
+        if self._source_type in ("Playlist", "Spotify"):
+            features |= (
+                MediaPlayerEntityFeature.PREVIOUS_TRACK
+                | MediaPlayerEntityFeature.NEXT_TRACK
+                | MediaPlayerEntityFeature.PAUSE
+                | MediaPlayerEntityFeature.PLAY
+                | MediaPlayerEntityFeature.PLAY_MEDIA
+                | MediaPlayerEntityFeature.BROWSE_MEDIA
+            )
+
+        return features
+
+    def _state(self) -> MediaPlayerState:
+        """Return the state the reported standby and transport describe."""
+        if self._in_standby:
+            return MediaPlayerState.OFF
+        if self._transport_state == "Paused":
+            return MediaPlayerState.PAUSED
+        if self._transport_state in ("Playing", "Buffering"):
+            return MediaPlayerState.PLAYING
+        if self._transport_state == "Stopped":
+            return MediaPlayerState.IDLE
+        # Device is playing an external source with no transport controls
+        return MediaPlayerState.PLAYING
 
     @catch_request_errors(SERVICE_TURN_ON)
     @override
