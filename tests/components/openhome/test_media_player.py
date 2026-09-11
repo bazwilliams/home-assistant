@@ -404,3 +404,133 @@ async def test_state_mapping(
     await setup_media_player(hass, mock_config_entry)
 
     assert hass.states.get(ENTITY_ID).state == expected_state
+
+
+@pytest.fixture
+def subscribed_device(mock_device: MagicMock) -> MagicMock:
+    """Return a device that reports its own changes instead of being polled."""
+    mock_device.events_enabled = True
+    return mock_device
+
+
+def emitted_callback(mock_device: MagicMock) -> Callable[..., Any]:
+    """Return the callback the entity handed to subscribe()."""
+    mock_device.subscribe.assert_awaited_once()
+    return mock_device.subscribe.await_args.args[0]
+
+
+async def test_subscribes_and_stops_polling(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+) -> None:
+    """Test a device that reports changes is subscribed to, not polled."""
+    await setup_integration(hass, mock_config_entry)
+
+    subscribed_device.subscribe.assert_awaited_once()
+
+    subscribed_device.room.reset_mock()
+    await async_poll(hass)
+
+    subscribed_device.room.assert_not_awaited()
+
+
+async def test_polls_when_the_device_cannot_report_changes(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_device: MagicMock
+) -> None:
+    """Test a device without the services for events is polled."""
+    mock_device.events_enabled = False
+
+    await setup_media_player(hass, mock_config_entry)
+
+    mock_device.subscribe.assert_not_awaited()
+    mock_device.room.assert_awaited()
+
+
+async def test_failed_subscription_falls_back_to_polling(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+) -> None:
+    """Test the device is still polled when subscribing fails."""
+    subscribed_device.subscribe.side_effect = OpenhomeConnectionError("refused")
+
+    await setup_media_player(hass, mock_config_entry)
+
+    subscribed_device.room.assert_awaited()
+
+
+async def test_event_updates_the_state(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+) -> None:
+    """Test a reported change is published without polling the device."""
+    await setup_integration(hass, mock_config_entry)
+    handle = emitted_callback(subscribed_device)
+
+    handle({"is_in_standby": False, "transport_state": "Paused"})
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_PAUSED
+
+    handle({"transport_state": "Stopped"})
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_IDLE
+
+
+async def test_event_applies_only_what_changed(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+) -> None:
+    """Test a later event does not discard what an earlier one reported."""
+    await setup_integration(hass, mock_config_entry)
+    handle = emitted_callback(subscribed_device)
+
+    handle({"is_in_standby": False, "transport_state": "Playing", "volume": 30})
+    await hass.async_block_till_done()
+
+    handle({"volume": 70})
+    await hass.async_block_till_done()
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.attributes[ATTR_MEDIA_VOLUME_LEVEL] == 0.7
+    # The standby and transport from the first event still decide the state.
+    assert state.state == STATE_PLAYING
+
+
+async def test_lost_subscription_marks_unavailable(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test losing the subscription marks the device unavailable."""
+    await setup_integration(hass, mock_config_entry)
+    handle = emitted_callback(subscribed_device)
+
+    handle({"is_in_standby": False, "transport_state": "Playing"})
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY_ID).state == STATE_PLAYING
+
+    handle({"is_subscribed": False})
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+    assert "Lost the event subscription" in caplog.text
+
+
+async def test_unsubscribes_on_removal(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+) -> None:
+    """Test the subscription is released when the entry is unloaded."""
+    await setup_integration(hass, mock_config_entry)
+
+    assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    subscribed_device.unsubscribe.assert_awaited_once()

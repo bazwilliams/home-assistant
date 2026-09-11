@@ -99,6 +99,10 @@ def mock_device_class() -> Generator[MagicMock]:
         device.is_in_standby = AsyncMock(return_value=False)
         device.transport_state = AsyncMock(return_value="Playing")
         device.software_status = AsyncMock(return_value=None)
+        # Polling by default; the event tests turn this on.
+        device.events_enabled = False
+        device.subscribe = AsyncMock()
+        device.unsubscribe = AsyncMock()
         device.update_firmware = AsyncMock()
         for method in ACTION_METHODS:
             setattr(device, method.__name__, AsyncMock())

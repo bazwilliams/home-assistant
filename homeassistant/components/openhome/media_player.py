@@ -31,7 +31,7 @@ from homeassistant.const import (
     SERVICE_VOLUME_SET,
     SERVICE_VOLUME_UP,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -124,6 +124,44 @@ class OpenhomeDevice(MediaPlayerEntity):
             model=device.model_name(),
             name=device.friendly_name(),
         )
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to the device, where it can report its own changes."""
+        if not self._device.events_enabled:
+            return
+
+        try:
+            await self._device.subscribe(self._handle_event)
+        except OpenhomeError as err:
+            # Polling still works, so a device that refuses is not an error.
+            _LOGGER.debug(
+                "Could not subscribe to %s, polling it instead: %s",
+                self.entity_id,
+                err,
+            )
+            return
+
+        self._attr_should_poll = False
+
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop receiving events."""
+        await self._device.unsubscribe()
+
+    @callback
+    def _handle_event(self, changes: dict[str, Any]) -> None:
+        """Apply what the device reported and publish the new state."""
+        if changes.get("is_subscribed") is False:
+            # Renewal failed. Nothing further arrives until we resubscribe.
+            _LOGGER.warning("Lost the event subscription to %s", self.entity_id)
+            self._attr_available = False
+            self.async_write_ha_state()
+            return
+
+        self._apply(changes)
+        self._attr_available = True
+        self.async_write_ha_state()
 
     async def async_update(self) -> None:
         """Update state of device."""
