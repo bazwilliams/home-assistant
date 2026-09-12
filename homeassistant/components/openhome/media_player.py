@@ -218,17 +218,18 @@ class OpenhomeDevice(MediaPlayerEntity):
 
             if not self._device.is_subscribed:
                 await self._async_reconnect()
-                return
+            else:
+                try:
+                    self._lease = await self._device.renew()
+                except OpenhomeError as err:
+                    _LOGGER.debug(
+                        "%s no longer holds its subscription: %s", self.entity_id, err
+                    )
+                    # Left unsubscribed, so the next renewal picks it back up.
+                    await self._async_device_gone()
 
-            try:
-                self._lease = await self._device.renew()
-            except OpenhomeError as err:
-                _LOGGER.debug(
-                    "%s no longer holds its subscription: %s", self.entity_id, err
-                )
-                # Left unsubscribed, so the next renewal picks it back up.
-                await self._async_device_gone()
-
+        # However that went. A device that could not be reached this time is
+        # only found again by coming round to look for it once more.
         self._async_schedule_renewal()
 
     async def _async_ssdp_change(

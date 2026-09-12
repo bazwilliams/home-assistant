@@ -1054,3 +1054,37 @@ async def test_a_polled_device_is_not_also_checked(
     mock_device.room.reset_mock()
     await async_poll(hass)
     mock_device.room.assert_awaited()
+
+
+async def test_a_device_still_away_at_the_next_renewal_is_kept_looked_for(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test a device that stays away is still being looked for.
+
+    The first renewal finds the subscription gone and releases it. The next
+    one has to find the device unreachable and come round again, or a device
+    that is merely slow to return is never picked up.
+    """
+    await setup_integration(hass, mock_config_entry)
+
+    # It has forgotten us, and is not reachable to be taken up again.
+    subscribed_device.renew.side_effect = OpenhomeDeviceError("forgotten")
+    subscribed_device.init.side_effect = OpenhomeConnectionError("no route")
+    await async_advance(hass, freezer, 6)
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+    assert not subscribed_device.is_subscribed
+
+    # From here, every renewal that comes round should try to reach it.
+    subscribed_device.init.reset_mock()
+
+    await async_advance(hass, freezer, 6)
+    assert subscribed_device.init.await_count == 1
+
+    await async_advance(hass, freezer, 6)
+    assert subscribed_device.init.await_count == 2, (
+        "the device is never looked for again: a failed reconnect schedules "
+        "no further renewal, so the loop stops"
+    )
