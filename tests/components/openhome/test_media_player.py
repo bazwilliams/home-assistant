@@ -1,11 +1,14 @@
 """Tests for the Openhome media player platform."""
 
+import asyncio
 from collections.abc import Callable, Generator
+from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from freezegun.api import FrozenDateTimeFactory
 from openhomedevice.device import Device
-from openhomedevice.exceptions import OpenhomeConnectionError
+from openhomedevice.exceptions import OpenhomeConnectionError, OpenhomeDeviceError
 import pytest
 from syrupy.assertion import SnapshotAssertion
 
@@ -21,6 +24,7 @@ from homeassistant.components.media_player import (
     SERVICE_SELECT_SOURCE,
     MediaType,
 )
+from homeassistant.components.media_source import PlayMedia
 from homeassistant.components.openhome.const import DOMAIN
 from homeassistant.components.openhome.services import (
     ATTR_PIN_INDEX,
@@ -47,12 +51,11 @@ from homeassistant.const import (
     Platform,
 )
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.service_info.ssdp import SsdpServiceInfo
 
-from . import async_poll, setup_integration
-from .conftest import HOST, TRACK_INFO
+from . import async_advance, async_poll, setup_integration
+from .conftest import LEASE, SSDP_SERVICE_TYPES, TRACK_INFO, announcement, reached
 
 from tests.common import MockConfigEntry, snapshot_platform
 
@@ -283,6 +286,69 @@ async def test_action_error_is_raised(
     assert err.value.translation_domain == DOMAIN
     assert err.value.translation_key == service
     mocked.assert_awaited()
+
+
+async def test_play_media_rejects_anything_but_music(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_device: MagicMock
+) -> None:
+    """Test asking for media the device cannot play is reported, not ignored."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+    await setup_media_player(hass, mock_config_entry)
+
+    with pytest.raises(ServiceValidationError) as err:
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: MediaType.VIDEO,
+                ATTR_MEDIA_CONTENT_ID: MEDIA_ID,
+            },
+            blocking=True,
+        )
+
+    assert err.value.translation_domain == DOMAIN
+    assert err.value.translation_key == "unsupported_media_type"
+    assert err.value.translation_placeholders == {"media_type": MediaType.VIDEO}
+    mock_device.play_media.assert_not_awaited()
+
+
+async def test_play_media_resolves_a_media_source(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_device: MagicMock
+) -> None:
+    """Test a media source item is resolved to a URL the device can fetch."""
+    mock_device.source.return_value = {
+        "index": 0,
+        "name": "Playlist",
+        "type": "Playlist",
+    }
+    await setup_media_player(hass, mock_config_entry)
+
+    with patch(
+        "homeassistant.components.media_source.async_resolve_media",
+        AsyncMock(return_value=PlayMedia(MEDIA_ID, "audio/flac")),
+    ) as resolve:
+        await hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_ENTITY_ID: ENTITY_ID,
+                ATTR_MEDIA_CONTENT_TYPE: "audio/flac",
+                ATTR_MEDIA_CONTENT_ID: "media-source://media_source/local/song.flac",
+            },
+            blocking=True,
+        )
+
+    resolve.assert_awaited_once()
+    # Resolving settles the type as well as the URL, so the music-only check
+    # must run after it rather than reject the media source item itself.
+    mock_device.play_media.assert_awaited_once_with(
+        {"title": "Home Assistant", "uri": MEDIA_ID}
+    )
 
 
 async def test_invoke_pin_calls_device(
@@ -538,16 +604,24 @@ async def test_unsubscribes_on_removal(
     subscribed_device.unsubscribe.assert_awaited_once()
 
 
-def announcement(bootid: int | None = None) -> SsdpServiceInfo:
-    """Return an SSDP announcement, optionally carrying a boot id."""
-    headers = {} if bootid is None else {ssdp.ATTR_SSDP_BOOTID: str(bootid)}
-    return SsdpServiceInfo(
-        ssdp_usn="uuid:uuid",
-        ssdp_st="urn:av-openhome-org:service:Product:1",
-        ssdp_location=HOST,
-        ssdp_headers=headers,
-        upnp={},
-    )
+def has_gone(device: MagicMock) -> None:
+    """Stop the device answering, as one that has really gone does."""
+    device.init.side_effect = OpenhomeConnectionError("device unreachable")
+
+
+def subscribes(device: MagicMock) -> Callable[..., Any]:
+    """Return a subscribe that succeeds, as the conftest one does."""
+
+    async def subscribe(_callback) -> None:
+        await reached()
+        device.is_subscribed = True
+
+    return subscribe
+
+
+def has_returned(device: MagicMock) -> None:
+    """Let the device answer again."""
+    device.init.side_effect = reached
 
 
 def ssdp_callback(mock_ssdp_register: AsyncMock) -> Callable[..., Any]:
@@ -569,6 +643,49 @@ async def test_registers_for_its_own_announcements(
     assert mock_ssdp_register.await_args.args[2] == {"_udn": "uuid"}
 
 
+async def test_announcement_burst_subscribes_once(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+) -> None:
+    """Test the announcements replayed at startup do not stack subscriptions.
+
+    Registering replays one announcement per service the device offers, before
+    any of them can have been handled, so every one of them sees a device that
+    is not subscribed yet.
+    """
+    await setup_integration(hass, mock_config_entry)
+    await hass.async_block_till_done()
+
+    assert len(SSDP_SERVICE_TYPES) > 1
+    subscribed_device.subscribe.assert_awaited_once()
+    subscribed_device.init.assert_awaited_once()
+
+
+async def test_announcements_leave_a_polled_device_alone(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test a device that cannot report changes is not reconnected on every one.
+
+    It never becomes subscribed, so treating that as a reason to reconnect
+    would re-read its description for as long as it keeps announcing itself.
+    """
+    mock_device.events_enabled = False
+    await setup_integration(hass, mock_config_entry)
+    await hass.async_block_till_done()
+
+    mock_device.init.reset_mock()
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    mock_device.init.assert_not_awaited()
+
+
 async def test_byebye_marks_unavailable(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
@@ -583,11 +700,63 @@ async def test_byebye_marks_unavailable(
     await hass.async_block_till_done()
     assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
 
+    has_gone(subscribed_device)
     await handle_ssdp(announcement(), ssdp.SsdpChange.BYEBYE)
     await hass.async_block_till_done()
 
     assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
     subscribed_device.unsubscribe.assert_awaited()
+
+
+async def test_byebye_reports_unavailable_before_releasing(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test the device is reported gone without waiting to release it.
+
+    It is no longer there to release the subscription, so every service it
+    offered has to time out and be retried first.
+    """
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    states = []
+    subscribed_device.unsubscribe.side_effect = lambda: states.append(
+        hass.states.get(ENTITY_ID).state
+    )
+
+    await handle_ssdp(announcement(), ssdp.SsdpChange.BYEBYE)
+    await hass.async_block_till_done()
+
+    assert states == [STATE_UNAVAILABLE]
+
+
+async def test_goodbye_from_a_restart_is_not_taken_at_its_word(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test a device that answers is kept, whatever its goodbye said.
+
+    Restarting, it says goodbye and announces itself in one breath. Those
+    reach us in either order, so the goodbye can arrive once the
+    announcement has already picked the device back up.
+    """
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+    subscribed_device.subscribe.reset_mock()
+
+    await handle_ssdp(announcement(), ssdp.SsdpChange.BYEBYE)
+    await hass.async_block_till_done()
+
+    # Left unsubscribed it would keep the state it had and never change
+    # again, which reads as a working device rather than a lost one.
+    assert subscribed_device.is_subscribed
+    subscribed_device.subscribe.assert_awaited_once()
+    assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
 
 
 async def test_alive_resubscribes_after_byebye(
@@ -600,10 +769,11 @@ async def test_alive_resubscribes_after_byebye(
     await setup_integration(hass, mock_config_entry)
     handle_ssdp = ssdp_callback(mock_ssdp_register)
 
-    subscribed_device.is_subscribed = False
+    has_gone(subscribed_device)
     await handle_ssdp(announcement(), ssdp.SsdpChange.BYEBYE)
     await hass.async_block_till_done()
 
+    has_returned(subscribed_device)
     subscribed_device.init.reset_mock()
     subscribed_device.subscribe.reset_mock()
 
@@ -613,6 +783,49 @@ async def test_alive_resubscribes_after_byebye(
     # Re-read the description: a device that restarted may have moved.
     subscribed_device.init.assert_awaited_once()
     subscribed_device.subscribe.assert_awaited_once()
+
+
+async def test_recovery_burst_resubscribes_once(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test coming back is done once, however many announcements say so.
+
+    A device announces every service it offers when it comes up, and all of
+    those arrive after the first of them has already picked it back up.
+    """
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    has_gone(subscribed_device)
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.BYEBYE)
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+
+    has_returned(subscribed_device)
+    subscribed_device.init.reset_mock()
+    subscribed_device.subscribe.reset_mock()
+    subscribed_device.unsubscribe.reset_mock()
+
+    # Announcements reach a callback as separate jobs, so they are in flight
+    # together rather than one after another.
+    await asyncio.gather(
+        *(
+            handle_ssdp(
+                announcement(bootid=1, service_type=service_type), ssdp.SsdpChange.ALIVE
+            )
+            for service_type in SSDP_SERVICE_TYPES
+        )
+    )
+    await hass.async_block_till_done()
+
+    assert len(SSDP_SERVICE_TYPES) > 1
+    subscribed_device.init.assert_awaited_once()
+    subscribed_device.subscribe.assert_awaited_once()
+    subscribed_device.unsubscribe.assert_not_awaited()
+    assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
 
 
 async def test_alive_while_subscribed_is_left_alone(
@@ -625,7 +838,6 @@ async def test_alive_while_subscribed_is_left_alone(
     await setup_integration(hass, mock_config_entry)
     handle_ssdp = ssdp_callback(mock_ssdp_register)
 
-    subscribed_device.is_subscribed = True
     subscribed_device.subscribe.reset_mock()
 
     await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
@@ -645,21 +857,45 @@ async def test_reboot_resubscribes(
     await setup_integration(hass, mock_config_entry)
     handle_ssdp = ssdp_callback(mock_ssdp_register)
 
-    subscribed_device.is_subscribed = True
     await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
     await hass.async_block_till_done()
+    assert subscribed_device.is_subscribed
 
     subscribed_device.subscribe.reset_mock()
-    # The device restarted and has forgotten the subscription it granted.
-    subscribed_device.unsubscribe.side_effect = lambda: setattr(
-        subscribed_device, "is_subscribed", False
-    )
+    subscribed_device.unsubscribe.reset_mock()
 
     await handle_ssdp(announcement(bootid=2), ssdp.SsdpChange.ALIVE)
     await hass.async_block_till_done()
 
-    subscribed_device.unsubscribe.assert_awaited()
+    # The subscription it granted before the restart is dropped, not reused.
+    subscribed_device.unsubscribe.assert_awaited_once()
     subscribed_device.subscribe.assert_awaited_once()
+    assert subscribed_device.is_subscribed
+
+
+async def test_announcement_without_a_boot_id_says_nothing(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    mock_ssdp_register: AsyncMock,
+) -> None:
+    """Test the optional boot id header is not read as a restart when absent.
+
+    Nor does its absence discard the boot id we were last told, which the
+    next announcement to carry one is compared against.
+    """
+    await setup_integration(hass, mock_config_entry)
+    handle_ssdp = ssdp_callback(mock_ssdp_register)
+
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+    subscribed_device.subscribe.reset_mock()
+
+    await handle_ssdp(announcement(), ssdp.SsdpChange.ALIVE)
+    await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
+    await hass.async_block_till_done()
+
+    subscribed_device.subscribe.assert_not_awaited()
 
 
 async def test_update_announcement_is_ignored(
@@ -672,7 +908,6 @@ async def test_update_announcement_is_ignored(
     await setup_integration(hass, mock_config_entry)
     handle_ssdp = ssdp_callback(mock_ssdp_register)
 
-    subscribed_device.is_subscribed = True
     await handle_ssdp(announcement(bootid=1), ssdp.SsdpChange.ALIVE)
     await hass.async_block_till_done()
 
@@ -686,3 +921,136 @@ async def test_update_announcement_is_ignored(
 
     subscribed_device.unsubscribe.assert_not_awaited()
     subscribed_device.subscribe.assert_not_awaited()
+
+
+async def test_an_active_device_is_renewed_too(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test reporting changes does not excuse a device from being renewed.
+
+    Renewing on quiet alone leaves the device being used the one that is
+    never renewed, until its lease runs out and it goes silently unheard.
+    """
+    await setup_integration(hass, mock_config_entry)
+    handle_event = emitted_callback(subscribed_device)
+    subscribed_device.renew.reset_mock()
+
+    # Reporting throughout, as a device someone is listening to does.
+    for _ in range(4):
+        handle_event({"is_in_standby": False})
+        await hass.async_block_till_done()
+        await async_advance(hass, freezer, 2)
+
+    subscribed_device.renew.assert_awaited()
+    assert subscribed_device.is_subscribed
+
+
+async def test_the_subscription_is_renewed_before_the_lease_runs_out(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test renewing happens well inside the lease the device granted."""
+    await setup_integration(hass, mock_config_entry)
+    subscribed_device.renew.reset_mock()
+
+    await async_advance(hass, freezer, int(LEASE.total_seconds() // 60) - 1)
+
+    subscribed_device.renew.assert_awaited()
+    assert subscribed_device.is_subscribed
+    assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
+
+
+async def test_a_short_lease_is_renewed_sooner(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test a device granting less than we would otherwise wait is still kept.
+
+    A device caps the lease at its own maximum, which can be shorter than
+    the interval renewals would otherwise run at.
+    """
+    subscribed_device.lease = timedelta(minutes=4)
+    await setup_integration(hass, mock_config_entry)
+    subscribed_device.renew.reset_mock()
+
+    await async_advance(hass, freezer, 3)
+
+    subscribed_device.renew.assert_awaited()
+    assert subscribed_device.is_subscribed
+
+
+async def test_a_device_that_has_forgotten_us_goes_unavailable(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test the one request a device answers differently is acted on.
+
+    It sends no goodbye and answers everything else as usual, so a renewal
+    refused is the only sign there is.
+    """
+    await setup_integration(hass, mock_config_entry)
+    emitted_callback(subscribed_device)({"is_in_standby": False})
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
+
+    subscribed_device.renew.side_effect = OpenhomeDeviceError("forgotten")
+    await async_advance(hass, freezer, 6)
+
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+    assert not subscribed_device.is_subscribed
+
+
+async def test_a_device_that_comes_back_is_subscribed_to_again(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    subscribed_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test recovery, which nothing announces: no goodbye, so no arrival."""
+    await setup_integration(hass, mock_config_entry)
+
+    subscribed_device.renew.side_effect = OpenhomeDeviceError("forgotten")
+    has_gone(subscribed_device)
+    await async_advance(hass, freezer, 6)
+    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
+
+    subscribed_device.renew.side_effect = None
+    has_returned(subscribed_device)
+    subscribed_device.subscribe.reset_mock()
+    await async_advance(hass, freezer, 6)
+
+    subscribed_device.subscribe.assert_awaited_once()
+    assert hass.states.get(ENTITY_ID).state != STATE_UNAVAILABLE
+
+
+async def test_a_polled_device_is_not_also_checked(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_device: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test polling reports its own failures without the check joining in."""
+    mock_device.events_enabled = False
+    await setup_integration(hass, mock_config_entry)
+
+    mock_device.init.reset_mock()
+    mock_device.subscribe.reset_mock()
+    await async_advance(hass, freezer, 6)
+
+    mock_device.init.assert_not_awaited()
+    mock_device.subscribe.assert_not_awaited()
+
+    # Polling is how a device with no Transport service is followed at all,
+    # so the check must not have quietly taken over from it.
+    mock_device.room.reset_mock()
+    await async_poll(hass)
+    mock_device.room.assert_awaited()

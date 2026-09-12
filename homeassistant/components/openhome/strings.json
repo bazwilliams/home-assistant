@@ -33,6 +33,9 @@
     "turn_on": {
       "message": "Failed to turn on"
     },
+    "unsupported_media_type": {
+      "message": "Cannot play {media_type}: this device plays music only"
+    },
     "volume_down": {
       "message": "Failed to turn down the volume"
     },
