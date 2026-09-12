@@ -47,6 +47,11 @@ SOURCES = [
     {"index": 1, "name": "Radio", "type": "Radio"},
 ]
 
+# The subscription coroutines the entity drives, referenced from the library
+# so that one going missing fails the tests here rather than at runtime. The
+# entity renews for itself, which is only possible from 2.7 onwards.
+SUBSCRIPTION_METHODS = (Device.subscribe, Device.renew, Device.unsubscribe)
+
 # The device coroutines the actions drive, referenced from the library so a
 # rename upstream fails the tests rather than leaving an action uncovered.
 ACTION_METHODS = (
