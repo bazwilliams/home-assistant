@@ -59,18 +59,6 @@ _LOGGER = logging.getLogger(__name__)
 RENEWAL_INTERVAL = timedelta(minutes=5)
 
 
-def _bootid(info: SsdpServiceInfo) -> int | None:
-    """Return the boot id the announcement carries, if it has one.
-
-    A device changes its boot id when it restarts. Reporting one at all is
-    optional, so an announcement without one says nothing either way.
-    """
-    try:
-        return int(info.ssdp_headers[ssdp.ATTR_SSDP_BOOTID], 10)
-    except KeyError, ValueError:
-        return None
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: OpenhomeConfigEntry,
@@ -138,7 +126,6 @@ class OpenhomeDevice(MediaPlayerEntity):
         self._source_type: str | None = None
         self._in_standby: bool | None = None
         self._transport_state: str | None = None
-        self._bootid: int | None = None
         self._lease = RENEWAL_INTERVAL
         self._cancel_renewal: CALLBACK_TYPE | None = None
         self._connection_lock = asyncio.Lock()
@@ -185,7 +172,7 @@ class OpenhomeDevice(MediaPlayerEntity):
         self._async_schedule_renewal()
 
     @callback
-    def _async_schedule_renewal(self) -> None:
+    def _async_schedule_renewal(self, delay: timedelta | None = None) -> None:
         """Come back before the lease the device granted runs out."""
         self._async_cancel_renewal()
 
@@ -193,9 +180,11 @@ class OpenhomeDevice(MediaPlayerEntity):
             # A polled device holds no subscription to keep.
             return
 
-        # Half a lease, so a device granting less than we asked for is still
-        # renewed in good time. Nothing renews on our behalf.
-        delay = min(RENEWAL_INTERVAL, self._lease / 2)
+        if delay is None:
+            # Half a lease, so a device granting less than we asked for is
+            # still renewed in good time. Nothing renews on our behalf.
+            delay = min(RENEWAL_INTERVAL, self._lease / 2)
+
         self._cancel_renewal = async_call_later(self.hass, delay, self._async_renew)
 
     @callback
@@ -235,50 +224,25 @@ class OpenhomeDevice(MediaPlayerEntity):
     async def _async_ssdp_change(
         self, info: SsdpServiceInfo, change: ssdp.SsdpChange
     ) -> None:
-        """React to the device announcing itself, or going away.
+        """Renew as soon as the device says anything about itself.
 
-        A device says so the moment it happens, where the activity check
-        only comes round to noticing minutes later.
+        Take a goodbye or an announcement as a sign the device may have
+        restarted, and the subscription therefore be out of date. Renewing
+        settles it either way: against a device that has forgotten the
+        subscription it takes out a new one, and against a device that has
+        really gone it fails and reports it unavailable.
+
+        Announcements only reach us when something about the device has
+        changed, so this is not woken by one repeating itself.
         """
         if change is ssdp.SsdpChange.UPDATE:
             # Only says the boot id is about to change. The announcement
             # that follows is the one to act on.
             return
 
-        bootid = _bootid(info)
-
-        # A device announces every service it offers, and reconnecting takes
-        # long enough for the rest of that burst to arrive mid-way.
-        async with self._connection_lock:
-            if change is ssdp.SsdpChange.BYEBYE:
-                _LOGGER.debug("%s said goodbye", self.entity_id)
-                await self._async_device_gone()
-                # A device that restarts says goodbye and announces itself in
-                # one breath, and the two reach us in either order, so take
-                # the goodbye as a prompt to look rather than as the answer.
-                await self._async_reconnect()
-                return
-
-            # A restart is worth acting on whether or not its goodbye
-            # arrived.
-            rebooted = (
-                bootid is not None
-                and self._bootid is not None
-                and bootid != self._bootid
-            )
-            if bootid is not None:
-                self._bootid = bootid
-
-            if not rebooted and self.available:
-                # It is only repeating itself, and we are already talking to it.
-                return
-
-            # It has just come up, so it has forgotten what it granted us.
-            if self._device.is_subscribed:
-                await self._device.unsubscribe()
-
-            _LOGGER.debug("%s announced itself, resubscribing", self.entity_id)
-            await self._async_reconnect()
+        # Rescheduling drops the renewal already pending, so a device
+        # announcing each of its services in turn is renewed once.
+        self._async_schedule_renewal(timedelta(0))
 
     async def _async_device_gone(self) -> None:
         """Report the device as unavailable, then release the subscription.
@@ -307,8 +271,7 @@ class OpenhomeDevice(MediaPlayerEntity):
 
         await self._async_subscribe()
 
-        # Being available again is also what makes the rest of the
-        # announcements in the same burst do nothing.
+        # Reaching it at all is what availability means here.
         self._attr_available = True
         self.async_write_ha_state()
 
