@@ -569,27 +569,6 @@ async def test_event_applies_only_what_changed(
     assert state.state == STATE_PLAYING
 
 
-async def test_lost_subscription_marks_unavailable(
-    hass: HomeAssistant,
-    mock_config_entry: MockConfigEntry,
-    subscribed_device: MagicMock,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Test losing the subscription marks the device unavailable."""
-    await setup_integration(hass, mock_config_entry)
-    handle = emitted_callback(subscribed_device)
-
-    handle({"is_in_standby": False, "transport_state": "Playing"})
-    await hass.async_block_till_done()
-    assert hass.states.get(ENTITY_ID).state == STATE_PLAYING
-
-    handle({"is_subscribed": False})
-    await hass.async_block_till_done()
-
-    assert hass.states.get(ENTITY_ID).state == STATE_UNAVAILABLE
-    assert "Lost the event subscription" in caplog.text
-
-
 async def test_unsubscribes_on_removal(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,

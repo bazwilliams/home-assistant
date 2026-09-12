@@ -319,15 +319,12 @@ class OpenhomeDevice(MediaPlayerEntity):
 
     @callback
     def _handle_event(self, changes: dict[str, Any]) -> None:
-        """Apply what the device reported and publish the new state."""
-        if changes.get("is_subscribed") is False:
-            # Nothing further arrives until we resubscribe, which the next
-            # activity check does once the device can be reached again.
-            _LOGGER.warning("Lost the event subscription to %s", self.entity_id)
-            self._attr_available = False
-            self.async_write_ha_state()
-            return
+        """Apply what the device reported and publish the new state.
 
+        Only ever changes: losing the subscription is not reported here,
+        because the device does not report it either. A renewal refused is
+        the whole of the notice there is.
+        """
         self._apply(changes)
         self._attr_available = True
         self.async_write_ha_state()
